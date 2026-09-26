@@ -181,10 +181,78 @@ class CDPBridgeClient:
         await asyncio.sleep(0.2)
 
 
-    async def send_chat_message(self, prompt: str, conversation_id: str = None, timeout_seconds: float = 75.0) -> dict:
+    async def set_reasoning_effort(self, target_level: str) -> bool:
+        """
+        Dynamically adjusts model reasoning effort:
+        - 'instant' / 'low' / '即时' -> 0
+        - 'medium' / '中' -> 1
+        - 'high' / '高' -> 2
+        """
+        level_map = {
+            'instant': 0, 'low': 0, '即时': 0, '0': 0,
+            'medium': 1, '中': 1, '1': 1,
+            'high': 2, '高': 2, '2': 2
+        }
+        if str(target_level).lower() not in level_map:
+            return False
+        target_val = level_map[str(target_level).lower()]
+
+        js = f"""
+        (() => {{
+            const btns = Array.from(document.querySelectorAll('button'));
+            const targetBtn = btns.find(b => (b.getAttribute('aria-label') || '').includes('模型') || ['即时', '中', '高'].includes((b.innerText || '').trim()));
+            if (!targetBtn) return {{ error: 'Model/Effort button not found' }};
+            
+            // Open the model/effort dropdown if not already open
+            let menu = document.querySelector('[role="menu"][data-state="open"]');
+            if (!menu) {{
+                targetBtn.dispatchEvent(new PointerEvent('pointerdown', {{ bubbles: true, cancelable: true }}));
+                targetBtn.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true }}));
+                targetBtn.click();
+            }}
+            
+            return new Promise(resolve => {{
+                setTimeout(() => {{
+                    const slider = document.querySelector('[role="slider"]');
+                    if (!slider) {{
+                        resolve({{ error: 'Slider not found in menu' }});
+                        return;
+                    }}
+                    
+                    let cur = parseInt(slider.getAttribute('aria-valuenow') || '2', 10);
+                    const target = {target_val};
+                    
+                    while (cur > target) {{
+                        slider.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37, which: 37, bubbles: true, cancelable: true }}));
+                        slider.dispatchEvent(new KeyboardEvent('keyup', {{ key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37, which: 37, bubbles: true, cancelable: true }}));
+                        cur--;
+                    }}
+                    while (cur < target) {{
+                        slider.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'ArrowRight', code: 'ArrowRight', keyCode: 39, which: 39, bubbles: true, cancelable: true }}));
+                        slider.dispatchEvent(new KeyboardEvent('keyup', {{ key: 'ArrowRight', code: 'ArrowRight', keyCode: 39, which: 39, bubbles: true, cancelable: true }}));
+                        cur++;
+                    }}
+                    
+                    setTimeout(() => {{
+                        document.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }}));
+                        resolve({{ success: true, target: target }});
+                    }}, 100);
+                }}, 300);
+            }});
+        }})()
+        """
+        res = await self.call("Runtime.evaluate", {"expression": js, "awaitPromise": True, "returnByValue": True})
+        val = res.get("result", {}).get("result", {}).get("value", {})
+        return bool(val.get("success"))
+
+    async def send_chat_message(self, prompt: str, conversation_id: str = None, effort: str = None, timeout_seconds: float = 75.0) -> dict:
         async with self.lock:
             await self.connect()
             await self.ensure_chat_mode()
+
+            # If reasoning effort is specified, adjust it before prompt submission
+            if effort:
+                await self.set_reasoning_effort(effort)
 
             current_dom_cid = await self.get_dom_conversation_id()
             if current_dom_cid:
@@ -200,6 +268,8 @@ class CDPBridgeClient:
 
             if needs_new_chat:
                 await self.trigger_new_chat()
+                if effort:
+                    await self.set_reasoning_effort(effort)
 
             # 1. Insert prompt using Selection & execCommand (preserves Unicode & multi-lines)
             insert_js = f"""
@@ -342,10 +412,20 @@ class BridgeHTTPHandler(BaseHTTPRequestHandler):
                 user_prompt = "Hello"
 
             conversation_id = data.get("conversation_id")
-            print(f"[Bridge] Request: prompt='{user_prompt[:40]}...', conv_id={conversation_id}")
+
+            # Extract reasoning effort if provided (instant / medium / high)
+            effort = data.get("effort") or data.get("reasoning_effort")
+            if not effort and isinstance(data.get("model"), str):
+                m_lower = data.get("model").lower()
+                for e in ["instant", "medium", "high"]:
+                    if e in m_lower:
+                        effort = e
+                        break
+
+            print(f"[Bridge] Request: prompt='{user_prompt[:40]}...', conv_id={conversation_id}, effort={effort}")
 
             future = asyncio.run_coroutine_threadsafe(
-                cdp_client.send_chat_message(user_prompt, conversation_id=conversation_id),
+                cdp_client.send_chat_message(user_prompt, conversation_id=conversation_id, effort=effort),
                 event_loop
             )
             try:
@@ -417,8 +497,11 @@ class BridgeHTTPHandler(BaseHTTPRequestHandler):
             models_data = {
                 "object": "list",
                 "data": [
-                    {"id": "chatgpt-desktop", "object": "model", "owned_by": "openai"},
-                    {"id": "gpt-6-sol", "object": "model", "owned_by": "openai"}
+                    {"id": "gpt-5.6-sol", "object": "model", "owned_by": "openai"},
+                    {"id": "gpt-5.6-sol-high", "object": "model", "owned_by": "openai"},
+                    {"id": "gpt-5.6-sol-medium", "object": "model", "owned_by": "openai"},
+                    {"id": "gpt-5.6-sol-instant", "object": "model", "owned_by": "openai"},
+                    {"id": "chatgpt-desktop", "object": "model", "owned_by": "openai"}
                 ]
             }
             resp_bytes = json.dumps(models_data, indent=2).encode('utf-8')
@@ -444,7 +527,7 @@ def is_port_in_use(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(('127.0.0.1', port)) == 0
 
-def ensure_chatgpt_running(cdp_port: int, custom_path: str = None, auto_launch: bool = True):
+def ensure_chatgpt_running(cdp_port: int, custom_path: str = None, user_data_dir: str = None, auto_launch: bool = True):
     if is_port_in_use(cdp_port):
         print(f"[+] ChatGPT Desktop is already running and listening on CDP port {cdp_port}")
         return True
@@ -463,7 +546,6 @@ def ensure_chatgpt_running(cdp_port: int, custom_path: str = None, auto_launch: 
         return False
 
     print(f"[+] Found ChatGPT executable: {app_path}")
-    print(f"[*] Launching ChatGPT with --remote-debugging-port={cdp_port}...")
     
     # Terminate existing non-debugging instance if running
     if sys.platform == "win32":
@@ -474,6 +556,12 @@ def ensure_chatgpt_running(cdp_port: int, custom_path: str = None, auto_launch: 
             pass
 
     args = [app_path, f"--remote-debugging-port={cdp_port}"]
+    if user_data_dir:
+        os.makedirs(user_data_dir, exist_ok=True)
+        print(f"[*] Using custom user data directory: {user_data_dir}")
+        args.append(f"--user-data-dir={user_data_dir}")
+
+    print(f"[*] Launching ChatGPT with: {' '.join(args)}...")
     subprocess.Popen(args)
     
     # Wait for CDP port to open
@@ -494,11 +582,19 @@ def main():
     parser.add_argument("--cdp-port", type=int, default=9223, help="ChatGPT CDP remote debugging port (default: 9223)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Local listen host (default: 127.0.0.1)")
     parser.add_argument("--chatgpt-path", type=str, default="", help="Custom path to ChatGPT.exe / ChatGPT.app")
+    parser.add_argument("--user-data-dir", type=str, default="", help="Custom user data directory (isolated profile)")
+    parser.add_argument("--isolated-profile", action="store_true", help="Use a dedicated isolated user data directory (~/.chatgpt-desktop-bridge-profile)")
+    parser.add_argument("--default-effort", type=str, choices=["instant", "medium", "high"], default=None, help="Set default reasoning effort (instant / medium / high)")
     parser.add_argument("--no-launch", action="store_true", help="Do not automatically launch ChatGPT Desktop")
     args = parser.parse_args()
 
+    # Determine user data dir if requested
+    user_data_dir = args.user_data_dir.strip()
+    if not user_data_dir and args.isolated_profile:
+        user_data_dir = os.path.join(os.path.expanduser("~"), ".chatgpt-desktop-bridge-profile")
+
     # Step 1: Ensure ChatGPT is running with CDP
-    if not ensure_chatgpt_running(args.cdp_port, custom_path=args.chatgpt_path, auto_launch=not args.no_launch):
+    if not ensure_chatgpt_running(args.cdp_port, custom_path=args.chatgpt_path, user_data_dir=user_data_dir, auto_launch=not args.no_launch):
         print("[-] Aborting bridge startup due to missing ChatGPT CDP connection.")
         sys.exit(1)
 
@@ -511,6 +607,18 @@ def main():
         event_loop.run_forever()
 
     threading.Thread(target=run_async_loop, daemon=True).start()
+
+    # Step 2.5: Apply default effort if configured
+    if args.default_effort:
+        future = asyncio.run_coroutine_threadsafe(
+            cdp_client.set_reasoning_effort(args.default_effort),
+            event_loop
+        )
+        try:
+            future.result(timeout=10)
+            print(f"[+] Initial reasoning effort set to: {args.default_effort}")
+        except Exception as e:
+            print(f"[!] Warning: Failed to set initial reasoning effort: {e}")
 
     # Step 3: Run multi-threaded HTTP server
     print("==================================================================")

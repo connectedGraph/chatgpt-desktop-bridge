@@ -98,8 +98,17 @@ pip install -r requirements.txt
 # 指定自定义安装路径
 python bridge.py --chatgpt-path "D:\Tools\ChatGPT\ChatGPT.exe"
 
-# 指定服务端口
+# 指定服务端口与调试端口
 python bridge.py --port 18080 --cdp-port 9223
+
+# 使用独立的用户数据目录（与日常使用的 ChatGPT 隔离，调试不污染主配置）
+python bridge.py --isolated-profile
+
+# 指定自定义的数据目录
+python bridge.py --user-data-dir "D:\ChatGPT_Profile"
+
+# 设置默认思考深度 (instant 即时 / medium 中 / high 高)
+python bridge.py --default-effort high
 
 # 已自行手动打开带调试端口的客户端，仅启动桥接层
 python bridge.py --no-launch
@@ -146,13 +155,27 @@ curl -X POST http://127.0.0.1:18080/chat \
 
 ---
 
+#### 请求示例（带思考深度调节）：
+```bash
+curl -X POST http://127.0.0.1:18080/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "推导欧拉公式并给出证明",
+    "effort": "high"
+  }'
+```
+> **思考深度说明**：支持三档调节：`"instant"` (即时思考，消耗额度最慢)、`"medium"` (中等思考)、`"high"` (深度思考，消耗额度较快)。
+
+---
+
 ### 2. `/v1/chat/completions` (OpenAI 标准兼容)
 
 支持任意支持 OpenAI API 标准的工具无缝对接：
 
 - **API Base URL**：`http://127.0.0.1:18080/v1`
 - **API Key**：可随意填写（如 `sk-local`）
-- **Model**：`chatgpt-desktop` 或 `gpt-6-sol`
+- **Model**：`gpt-5.6-sol`、`gpt-5.6-sol-high`、`gpt-5.6-sol-instant` 或 `chatgpt-desktop`
+- **Reasoning Effort**：兼容 OpenAI 标准字段 `reasoning_effort: "low" | "medium" | "high"`
 
 ```python
 from openai import OpenAI
@@ -163,7 +186,8 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="chatgpt-desktop",
+    model="gpt-5.6-sol",
+    reasoning_effort="high",
     messages=[
         {"role": "user", "content": "你好，请解释一下量子计算的基本概念"}
     ]
