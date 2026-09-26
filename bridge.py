@@ -83,35 +83,58 @@ class CDPBridgeClient:
     async def ensure_chat_mode(self):
         """
         Guards against accidentally staying in Codex/Work mode.
-        Ensures the UI is switched to standard 'ChatGPT' mode.
+        1. Checks and enforces the home mode toggle (聊天 vs 工作) to be '聊天' (Chat).
+        2. Checks top-left dropdown (Codex vs ChatGPT).
         """
         js_guard = """
         (() => {
-            const btns = Array.from(document.querySelectorAll('button'));
-            const modeBtn = btns.find(b => (b.getAttribute('aria-label') || '').includes('模式') || (b.innerText || '').includes('ChatGPT') || (b.innerText || '').includes('Codex'));
-            if (!modeBtn) return { status: 'no_mode_btn' };
+            const results = {};
             
-            const currentText = modeBtn.innerText || '';
-            const currentAria = modeBtn.getAttribute('aria-label') || '';
-            
-            // If already in ChatGPT mode, do nothing
-            if (currentText.includes('ChatGPT') || currentAria.includes('ChatGPT')) {
-                return { status: 'already_chat_mode' };
+            // 1. Check and enforce segmented toggle: "聊天" (Chat) vs "工作" (Work)
+            const toggleContainer = document.querySelector('[class*="home-mode-toggle"]');
+            if (toggleContainer) {
+                const buttons = Array.from(toggleContainer.querySelectorAll('button'));
+                const chatBtn = buttons.find(b => {
+                    const text = (b.innerText || '').trim();
+                    return text === '聊天' || text.toLowerCase() === 'chat' || b.className.includes('col-start-1');
+                });
+                if (chatBtn) {
+                    const isPressed = chatBtn.getAttribute('aria-pressed') === 'true';
+                    if (!isPressed) {
+                        chatBtn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+                        chatBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                        chatBtn.click();
+                        chatBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                        results.toggle = 'switched_to_chat';
+                    } else {
+                        results.toggle = 'already_chat';
+                    }
+                }
             }
             
-            // If in Codex / Work mode, open dropdown and switch to ChatGPT
-            modeBtn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
-            modeBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-            
-            setTimeout(() => {
-                const options = Array.from(document.querySelectorAll('div, button, [role="menuitem"]'));
-                const chatgptOption = options.find(el => el.innerText && el.innerText.trim().startsWith('ChatGPT'));
-                if (chatgptOption) {
-                    chatgptOption.click();
+            // 2. Check top-left mode dropdown (Codex vs ChatGPT)
+            const btns = Array.from(document.querySelectorAll('button'));
+            const modeBtn = btns.find(b => (b.getAttribute('aria-label') || '').includes('模式') || (b.innerText || '').includes('ChatGPT') || (b.innerText || '').includes('Codex'));
+            if (modeBtn) {
+                const currentText = modeBtn.innerText || '';
+                const currentAria = modeBtn.getAttribute('aria-label') || '';
+                if (!currentText.includes('ChatGPT') && !currentAria.includes('ChatGPT')) {
+                    modeBtn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+                    modeBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    setTimeout(() => {
+                        const options = Array.from(document.querySelectorAll('div, button, [role="menuitem"]'));
+                        const chatgptOption = options.find(el => el.innerText && el.innerText.trim().startsWith('ChatGPT'));
+                        if (chatgptOption) {
+                            chatgptOption.click();
+                        }
+                    }, 300);
+                    results.dropdown = 'switched_to_chat';
+                } else {
+                    results.dropdown = 'already_chat';
                 }
-            }, 300);
+            }
             
-            return { status: 'switched_to_chat' };
+            return results;
         })()
         """
         res = await self.call("Runtime.evaluate", {"expression": js_guard, "returnByValue": True})
@@ -138,11 +161,11 @@ class CDPBridgeClient:
     async def trigger_new_chat(self):
         js = """
         (() => {
-            const btns = Array.from(document.querySelectorAll('button'));
+            const btns = Array.from(document.querySelectorAll('button, a'));
             const newChatBtn = btns.find(b => {
                 const label = (b.getAttribute('aria-label') || '').toLowerCase();
                 const text = (b.innerText || '').toLowerCase();
-                return label.includes('新对话') || text.includes('新对话') || label.includes('new chat');
+                return label.includes('新聊天') || text.includes('新聊天') || label.includes('新对话') || text.includes('新对话') || label.includes('new chat');
             });
             if (newChatBtn) {
                 newChatBtn.click();
@@ -153,6 +176,10 @@ class CDPBridgeClient:
         """
         await self.call("Runtime.evaluate", {"expression": js, "returnByValue": True})
         await asyncio.sleep(0.5)
+        # Enforce chat mode switch upon entering new chat home screen
+        await self.ensure_chat_mode()
+        await asyncio.sleep(0.2)
+
 
     async def send_chat_message(self, prompt: str, conversation_id: str = None, timeout_seconds: float = 75.0) -> dict:
         async with self.lock:
